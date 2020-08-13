@@ -14,119 +14,51 @@ namespace blueprint
     namespace detail
     {
 
-        /** TODO: This nativeMethodWrapper is on its way out and needs to be replaced
-         *  with the LambdaHelper as used in pushVarToDukStack/readVarFromDukStack.
-         *  The helper allows lambdas with capture groups, so we can skip the manual
-         *  passing of stash in the `registerNativeMethod` hooks as well.
-         */
-        static duk_ret_t nativeMethodWrapper (duk_context* ctx)
-        {
-            // First we have to retrieve the actual function pointer and our engine pointer
-            // See: https://duktape.org/guide.html#hidden-symbol-properties
-            duk_push_current_function(ctx);
-            duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("NativeFunctionPtr"));
-
-            auto function = reinterpret_cast<EcmascriptEngine::NativeFunction>(duk_get_pointer(ctx, -1));
-            duk_pop(ctx);
-
-            // Then the engine...
-            duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("EnginePtr"));
-            auto* engine = static_cast<EcmascriptEngine*>(duk_get_pointer(ctx, -1));
-            duk_pop(ctx);
-
-            // Then the stash...
-            duk_get_prop_string(ctx, -1, DUK_HIDDEN_SYMBOL("StashPtr"));
-            auto* stash = duk_get_pointer(ctx, -1);
-
-            // Pop back both the pointer and the "current function"
-            duk_pop_2(ctx);
-
-            // Now we can collect our args
-            std::vector<juce::var> args;
-            int nargs = duk_get_top(ctx);
-
-            for (int i = 0; i < nargs; ++i)
-                args.push_back(engine->readVarFromDukStack(ctx, i));
-
-            // Now we can invoke the user method with its arguments
-            auto result = function(stash, juce::var::NativeFunctionArgs(
-                juce::var(),
-                args.data(),
-                static_cast<int>(args.size())
-            ));
-
-            // For an undefined result, return 0 to notify the duktape interpreter
-            if (result.isUndefined())
-                return 0;
-
-            // Otherwise, push the result to the stack and tell duktape
-            engine->pushVarToDukStack(ctx, result);
-            return 1;
-        }
-
         static void fatalErrorHandler (void* udata, const char* msg)
         {
-            (void) udata;  // Ignored in this case, silence warning
-
-            DBG("**Blueprint Fatal Error:** " << msg);
-            DBG("It is now unsafe to execute further code in the EcmascriptEngine.");
-
-            throw std::runtime_error(msg);
+            (void) udata; // Ignored in this case, silence warning
+            throw EcmascriptEngine::FatalError(msg);
         }
 
-        //TODO: Keep safeEvalString and safeCompileFile or make EcmascripEngine member funcs
-        //      now that we have out errorHandle wrapper in EcmascriptEngine? Passing
-        //      callback here feels a bit ambiguous in regards to popping the error
-        //      off of the stack after invoking the error callback. Whose responsibility is it etc.
-        template <typename T>
-        static bool safeEvalString(duk_context* ctx, const juce::String& s, T&& callback)
+        static void safeCall(duk_context* ctx, const int numArgs)
+        {
+            if (duk_pcall(ctx, numArgs) != DUK_EXEC_SUCCESS)
+            {
+                const juce::String stack = duk_safe_to_stacktrace(ctx, -1);
+                const juce::String msg = duk_safe_to_string(ctx, -1);
+
+                throw EcmascriptEngine::Error(msg, stack);
+            }
+        }
+
+        static void safeEvalString(duk_context* ctx, const juce::String& s)
         {
             if (duk_peval_string(ctx, s.toRawUTF8()) != 0)
             {
-                if (callback != nullptr)
-                {
-                    // Call the user provided error handler and indicate failure
-                    std::invoke(callback);
-                    return false;
-                }
+                const juce::String stack = duk_safe_to_stacktrace(ctx, -1);
+                const juce::String msg = duk_safe_to_string(ctx, -1);
 
-                duk_throw_raw(ctx);
+                throw EcmascriptEngine::Error(msg, stack);
             }
-
-            // Indicate success
-            return true;
         }
 
-        template<typename T>
-        static bool safeCompileFile(duk_context* ctx, const juce::File& file, T&& callback)
+        static void safeCompileFile(duk_context* ctx, const juce::File& file)
         {
+            auto const& name = file.getFileName().toRawUTF8();
+            auto const& body = file.loadFileAsString().toRawUTF8();
+
             // Push the js filename to be compiled/evaluated
-            duk_push_string(ctx, file.getFileName().toRawUTF8());
+            duk_push_string(ctx, name);
 
-            if (duk_pcompile_string_filename(ctx, DUK_COMPILE_EVAL, file.loadFileAsString().toRawUTF8()) != 0)
+            if (duk_pcompile_string_filename(ctx, DUK_COMPILE_EVAL, body) != 0)
             {
-                if (callback != nullptr)
-                {
-                    // Call the user provided error handler.js and indicate failure
-                    std::invoke(callback);
-                    return false;
-                }
+                const juce::String stack = duk_safe_to_stacktrace(ctx, -1);
+                const juce::String msg = duk_safe_to_string(ctx, -1);
 
-                duk_throw_raw(ctx);
+                throw EcmascriptEngine::Error(msg, stack);
             }
-
-            // Indicate success
-            return true;
        }
 
-/*
-       static void dumpContext(duk_context* ctx)
-       {
-           duk_push_context_dump(ctx);
-           DBG(duk_to_string(ctx, -1));
-           duk_pop(ctx);
-       }
-*/
     }
 
     //==============================================================================
@@ -137,31 +69,6 @@ namespace blueprint
 
         // Add console.log support
         duk_console_init(ctx, DUK_CONSOLE_FLUSH);
-
-        // Create our error handler wrapping a user supplied error callback.
-        errorHandler = [=]
-        {
-            if (onUncaughtError == nullptr)
-                duk_throw_raw(ctx);
-
-            const juce::String trace = duk_safe_to_stacktrace(ctx, -1);
-            const juce::String msg = duk_safe_to_string(ctx, -1);
-
-            // Call the user provided error handler
-            std::invoke(onUncaughtError, msg, trace);
-
-            // Clear out the stack so we can re-register native functions
-            // after we clear out the lambda release pool etc.
-            while (duk_get_top(ctx))
-            {
-                duk_remove(ctx, duk_get_top_index(ctx));
-            }
-
-            // Clear the LambdaHelper release pool as duktape does not call object
-            // finalizers in the event of an evaluation error or duk_pcall failure.
-            lambdaReleasePool.clear();
-        };
-
     }
 
     EcmascriptEngine::~EcmascriptEngine()
@@ -174,8 +81,12 @@ namespace blueprint
     {
         jassert(code.isNotEmpty());
 
-        if (!detail::safeEvalString(ctx, code, errorHandler))
-            return juce::var(EvaluationError);
+        try {
+            detail::safeEvalString(ctx, code);
+        } catch (Error const& err) {
+            internalErrorHandler();
+            throw err;
+        }
 
         auto result = readVarFromDukStack(ctx, -1);
         duk_pop(ctx);
@@ -188,66 +99,30 @@ namespace blueprint
         jassert(code.existsAsFile());
         jassert(code.loadFileAsString().isNotEmpty());
 
-        juce::var result = juce::var::undefined();
-
-        if (!detail::safeCompileFile(ctx, code, errorHandler))
-            return juce::var(EvaluationError);
-
-        // Call compiled function
-        if (duk_pcall(ctx, 0) != DUK_EXEC_SUCCESS)
-        {
-            errorHandler();
-            return juce::var(EvaluationError);
+        try {
+            detail::safeCompileFile(ctx, code);
+            detail::safeCall(ctx, 0);
+        } catch (Error const& err) {
+            internalErrorHandler();
+            throw err;
         }
 
         // Collect the return value
-        result = readVarFromDukStack(ctx, -1);
+        auto result = readVarFromDukStack(ctx, -1);
         duk_pop(ctx);
 
         return result;
     }
 
     //==============================================================================
-    void EcmascriptEngine::registerNativeMethod (const juce::String& name, NativeFunction fn, void* stash)
+    void EcmascriptEngine::registerNativeMethod (const juce::String& name, juce::var::NativeFunction fn)
     {
-        duk_push_global_object(ctx);
-
-        // We wrap the native function to provide a helper layer storing and retrieving the
-        // stash, and marshalling between the Duktape C interface and the NativeFunction interface
-        duk_push_c_function(ctx, detail::nativeMethodWrapper, DUK_VARARGS);
-
-        // Now we assign the pointers as properties of the wrapper function
-        duk_push_pointer(ctx, (void *) fn);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("NativeFunctionPtr"));
-        duk_push_pointer(ctx, (void *) this);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("EnginePtr"));
-        duk_push_pointer(ctx, stash);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("StashPtr"));
-
-        // And finally we assign the function to its name in the global namespace
-        duk_put_prop_string(ctx, -2, name.toRawUTF8());
+        registerNativeProperty(name, juce::var(fn));
     }
 
-    void EcmascriptEngine::registerNativeMethod (const juce::String& target, const juce::String& name, NativeFunction fn, void* stash)
+    void EcmascriptEngine::registerNativeMethod (const juce::String& target, const juce::String& name, juce::var::NativeFunction fn)
     {
-        // Evaluate the target string on the context, leaving the result on the stack
-        if (!detail::safeEvalString(ctx, target, errorHandler))
-            return;
-
-        // We wrap the native function to provide a helper layer storing and retrieving the
-        // stash, and marshalling between the Duktape C interface and the NativeFunction interface
-        duk_push_c_function(ctx, detail::nativeMethodWrapper, DUK_VARARGS);
-
-        // Now we assign the pointers as properties of the wrapper function
-        duk_push_pointer(ctx, (void *) fn);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("NativeFunctionPtr"));
-        duk_push_pointer(ctx, (void *) this);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("EnginePtr"));
-        duk_push_pointer(ctx, stash);
-        duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("StashPtr"));
-
-        // And finally we assign the function to its name in the global namespace
-        duk_put_prop_string(ctx, -2, name.toRawUTF8());
+        registerNativeProperty(target, name, juce::var(fn));
     }
 
     //==============================================================================
@@ -260,10 +135,12 @@ namespace blueprint
 
     void EcmascriptEngine::registerNativeProperty (const juce::String& target, const juce::String& name, const juce::var& value)
     {
-        // Evaluate the target string on the context, leaving the result on the stack
-        // TODO: Return specific error code if target not in stack?
-        if (!detail::safeEvalString(ctx, target, errorHandler))
-            return;
+        try {
+            detail::safeEvalString(ctx, target);
+        } catch (Error const& err) {
+            internalErrorHandler();
+            throw err;
+        }
 
         // Then assign the property
         pushVarToDukStack(ctx, value);
@@ -273,33 +150,37 @@ namespace blueprint
     //==============================================================================
     juce::var EcmascriptEngine::invoke (const juce::String& name, const std::vector<juce::var>& vargs)
     {
-        // Evaluate the target string on the context, leaving the result on the stack
-        // TODO: Return specific error code if name not in stack?
-        if (!detail::safeEvalString(ctx, name, errorHandler))
-            return juce::var::undefined();
+        try {
+            detail::safeEvalString(ctx, name);
 
-        // Ensure requested function exists on the stack
-        duk_require_function(ctx, -1);
+            if (!duk_is_function(ctx, -1)) {
+                throw Error("Invocation failed, target is not a function.");
+            }
 
-        // Push the args to the duktape stack
-        const auto nargs = static_cast<duk_idx_t>(vargs.size());
-        duk_require_stack_top(ctx, nargs);
+            // Push the args to the duktape stack
+            const auto nargs = static_cast<duk_idx_t>(vargs.size());
+            duk_require_stack_top(ctx, nargs);
 
-        for (auto& p : vargs)
-            pushVarToDukStack(ctx, p);
+            for (auto& p : vargs)
+                pushVarToDukStack(ctx, p);
 
-        // Invocation
-        if (duk_pcall(ctx, nargs) != DUK_EXEC_SUCCESS)
-        {
-            errorHandler();
-
-            // TODO: Return specific error code if invoke fails?
-            return juce::var::undefined();
+            // Invocation
+            detail::safeCall(ctx, nargs);
+        } catch (Error const& err) {
+            internalErrorHandler();
+            throw err;
         }
 
         // Collect the return value
         auto result = readVarFromDukStack(ctx, -1);
         duk_pop(ctx);
+
+        // Here, we know that we have potentially just pushed temporaries
+        // to the stack. Duktape will eventually get around to garbage collection,
+        // but specifically where we have LambdaHelper allocations for these
+        // temporaries, we want to keep our release pool fairly small. For that
+        // reason, we manually invoke a garbage collection pass right away.
+        duk_gc(ctx, 0);
 
         return result;
     }
@@ -335,14 +216,15 @@ namespace blueprint
         duk_debugger_detach(ctx);
     }
 
+    //==============================================================================
     void EcmascriptEngine::timerCallback()
     {
         duk_debugger_cooperate(ctx);
     }
 
     //==============================================================================
-    EcmascriptEngine::LambdaHelper::LambdaHelper(juce::var::NativeFunction fn)
-        : callback(std::move(fn)) {}
+    EcmascriptEngine::LambdaHelper::LambdaHelper(juce::var::NativeFunction fn, uint32_t _id)
+        : callback(std::move(fn)), id(_id) {}
 
     duk_ret_t EcmascriptEngine::LambdaHelper::invokeFromDukContext (duk_context* ctx)
     {
@@ -405,7 +287,6 @@ namespace blueprint
 
         // Clean up our lambda helper
         engine->removeLambdaHelper(helper);
-
         return 0;
     }
 
@@ -415,8 +296,18 @@ namespace blueprint
         lambdaReleasePool.erase(helper->id);
     }
 
-    //==============================================================================
-    /** Helper method to push a juce::var to the duktape stack. */
+    void EcmascriptEngine::internalErrorHandler()
+    {
+        // Clear out the stack so we can re-register native functions
+        // after we clear out the lambda release pool etc.
+        while (duk_get_top(ctx))
+            duk_remove(ctx, duk_get_top_index(ctx));
+
+        // Clear the LambdaHelper release pool as duktape does not call object
+        // finalizers in the event of an evaluation error or duk_pcall failure.
+        lambdaReleasePool.clear();
+    }
+
     void EcmascriptEngine::pushVarToDukStack (duk_context* ctx, const juce::var& v)
     {
         if (v.isVoid() || v.isUndefined())
@@ -464,7 +355,7 @@ namespace blueprint
             duk_push_c_function(ctx, LambdaHelper::invokeFromDukContext, DUK_VARARGS);
 
             // Now we assign the pointers as properties of the wrapper function
-            auto helper = std::make_unique<LambdaHelper>(v.getNativeFunction());
+            auto helper = std::make_unique<LambdaHelper>(v.getNativeFunction(), nextHelperId++);
             duk_push_pointer(ctx, (void *) helper.get());
             duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("LambdaHelperPtr"));
             duk_push_pointer(ctx, (void *) this);
@@ -473,7 +364,7 @@ namespace blueprint
             // Now we prepare the finalizer
             duk_push_c_function(ctx, LambdaHelper::callbackFinalizer, 1);
             duk_push_pointer(ctx, (void *) helper.get());
-            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("NativeFunctionPtr"));
+            duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("LambdaHelperPtr"));
             duk_push_pointer(ctx, (void *) this);
             duk_put_prop_string(ctx, -2, DUK_HIDDEN_SYMBOL("EnginePtr"));
             duk_set_finalizer(ctx, -2);
@@ -488,7 +379,6 @@ namespace blueprint
         jassertfalse;
     }
 
-    /** Helper method to read a juce::var from the duktape stack. */
     juce::var EcmascriptEngine::readVarFromDukStack (duk_context* ctx, duk_idx_t idx)
     {
         juce::var value;
@@ -556,11 +446,22 @@ namespace blueprint
                                 pushVarToDukStack(ctx, args.arguments[i]);
 
                             // Invocation
-                            if (duk_pcall(ctx, args.numArguments) != DUK_EXEC_SUCCESS)
-                                duk_throw(ctx);
+                            try {
+                                detail::safeCall(ctx, args.numArguments);
+                            } catch (Error const& err) {
+                                internalErrorHandler();
+                                throw err;
+                            }
 
                             // Clean the result and the stash off the top of the stack
                             duk_pop_2(ctx);
+
+                            // Here too, we know that we have potentially just pushed temporaries
+                            // to the stack. Duktape will eventually get around to garbage collection,
+                            // but specifically where we have LambdaHelper allocations for these
+                            // temporaries, we want to keep our release pool fairly small. For that
+                            // reason, we manually invoke a garbage collection pass right away.
+                            duk_gc(ctx, 0);
 
                             // Callbacks don't really need return args?
                             return juce::var();
