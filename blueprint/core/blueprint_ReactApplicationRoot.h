@@ -23,6 +23,7 @@
 #include "blueprint_View.h"
 #include "blueprint_ViewManager.h"
 
+
 namespace blueprint
 {
     //==============================================================================
@@ -128,13 +129,6 @@ namespace blueprint
             // Initialise the ViewManager
             initViewManager();
 
-            // TODO: Arguable that we always wish to reset the ViewManager in the event of an error.
-            //       In which case we may need to somewhat change the shape of EcmascriptEngine::onUncaughtError.
-            //       If callers reassign the callback we will lose the ViewManager reset.
-            engine.onUncaughtError = [this](const juce::String& msg, const juce::String& trace) {
-                handleBundleError(trace);
-            };
-
 #if JUCE_DEBUG
             enableHotReloading();
 
@@ -195,35 +189,31 @@ namespace blueprint
             // Clear error state from previous js evals
             errorText.reset();
 
-            if (!bundleValid)
-            {
+            try {
                 // Register internal React.js backend rendering methods
                 registerNativeRenderingHooks();
 
                 if (beforeBundleEval)
                     beforeBundleEval(bundle);
+
+                auto result = engine.evaluate(bundle);
+
+                if (afterBundleEval)
+                    afterBundleEval(bundle);
+
+                if (hotReloadEnabled)
+                {
+                    jassert(bundleWatcher);
+
+                    if (!bundleWatcher->watching(bundle))
+                        bundleWatcher->watch(bundle);
+                }
+
+                return result;
+            } catch (const EcmascriptEngine::Error& err) {
+                handleBundleError(err);
+                return juce::var();
             }
-
-            // Set bundleValid prior to evaluate. This ensures dispatchEvent/dispatchViewEvent
-            // can be called during EcmascriptEngine::evaluate. This is required to allow things
-            // like triggering View "Measure" callbacks when laying out the initial component tree.
-            bundleValid = true;
-            auto result = engine.evaluate(bundle);
-
-            bundleValid = result != EcmascriptEngine::EvaluationError;
-
-            if (bundleValid && afterBundleEval)
-                afterBundleEval(bundle);
-
-            if (hotReloadEnabled)
-            {
-                jassert(bundleWatcher);
-
-                if (!bundleWatcher->watching(bundle))
-                    bundleWatcher->watch(bundle);
-            }
-
-            return result;
         }
 
         /** Dispatches an event to the React internal view registry.
@@ -235,14 +225,13 @@ namespace blueprint
         void dispatchViewEvent (ViewId viewId, const juce::String& eventType, T... args)
         {
             JUCE_ASSERT_MESSAGE_THREAD
-            jassert(bundleValid);
 
             // We wish to safe guard against client code which attempts to dispatch an event immediately
             // after a bundle is evaluated should there be an evaluation error.
             // This ensures callers do not attempt to invoke a JS function which does not currently
             // exist in the engine.
-            if (bundleValid)
-                engine.invoke("__BlueprintNative__.dispatchViewEvent", viewId, eventType, std::forward<T>(args)...);
+            // TODO: remove view event dispatching from reactAppRoot; can now be done in View itself
+            engine.invoke("__BlueprintNative__.dispatchViewEvent", viewId, eventType, std::forward<T>(args)...);
         }
 
         /** Dispatches an event through Blueprint's EventBridge. */
@@ -250,14 +239,12 @@ namespace blueprint
         void dispatchEvent (const juce::String& eventType, T... args)
         {
             JUCE_ASSERT_MESSAGE_THREAD
-            jassert(bundleValid);
 
-            // We wish to safe guard against client code which attempts to dispatch an event immediately
-            // after a bundle is evaluated should there be an evaluation error.
-            // This ensures callers do not attempt to invoke a JS function which does not currently
-            // exist in the engine.
-            if (bundleValid)
+            try {
                 engine.invoke("__BlueprintNative__.dispatchEvent", eventType, std::forward<T>(args)...);
+            } catch (const EcmascriptEngine::Error& err) {
+                handleBundleError(err);
+            }
         }
 
         //==============================================================================
@@ -434,14 +421,14 @@ namespace blueprint
         }
 
         //==============================================================================
-        void handleBundleError(const juce::String& trace)
+        void handleBundleError(const EcmascriptEngine::Error& err)
         {
             JUCE_ASSERT_MESSAGE_THREAD
+            DBG(juce::String("Error in script evaluation: ") + err.what());
 
-            bundleValid = false;
             viewManager.reset();
+            errorText = std::make_unique<juce::AttributedString>(err.stack);
 
-            errorText = std::make_unique<juce::AttributedString>(trace);
 #if JUCE_WINDOWS
             errorText->setFont(juce::Font("Lucida Console", 18, juce::Font::FontStyleFlags::plain));
 #elif JUCE_MAC
@@ -519,75 +506,52 @@ namespace blueprint
         {
             engine.registerNativeProperty("__BlueprintNative__", juce::JSON::parse("{}"));
 
-            engine.registerNativeMethod("__BlueprintNative__", "createViewInstance", [](void* stash, const juce::var::NativeFunctionArgs& args) {
-                auto self = reinterpret_cast<ReactApplicationRoot*>(stash);
-
-                jassert (self != nullptr);
-                jassert (self->viewManager);
+            engine.registerNativeMethod("__BlueprintNative__", "createViewInstance", [this](const juce::var::NativeFunctionArgs& args) {
                 jassert (args.numArguments == 1);
-
-                ViewManager* const viewManager = self->getViewManager();
-                jassert(viewManager);
+                jassert (viewManager);
 
                 juce::String viewType = args.arguments[0].toString();
                 ViewId viewId = viewManager->createViewInstance(viewType);
 
                 return juce::var(viewId);
-            }, (void *) this);
+            });
 
-            engine.registerNativeMethod("__BlueprintNative__", "createTextViewInstance", [](void* stash, const juce::var::NativeFunctionArgs& args) {
-                auto self = reinterpret_cast<ReactApplicationRoot*>(stash);
-
-                jassert (self != nullptr);
+            engine.registerNativeMethod("__BlueprintNative__", "createTextViewInstance", [this](const juce::var::NativeFunctionArgs& args) {
                 jassert (args.numArguments == 1);
-
-                ViewManager* const viewManager = self->getViewManager();
                 jassert(viewManager);
 
                 juce::String textValue = args.arguments[0].toString();
                 ViewId viewId = viewManager->createTextViewInstance(textValue);
 
                 return juce::var(viewId);
-            }, (void *) this);
+            });
 
-            engine.registerNativeMethod("__BlueprintNative__", "setViewProperty", [](void* stash, const juce::var::NativeFunctionArgs& args) {
-                auto self = reinterpret_cast<ReactApplicationRoot*>(stash);
-
-                jassert (self != nullptr);
+            engine.registerNativeMethod("__BlueprintNative__", "setViewProperty", [this](const juce::var::NativeFunctionArgs& args) {
                 jassert (args.numArguments == 3);
+                jassert(viewManager);
 
                 ViewId viewId = args.arguments[0];
                 auto propertyName = args.arguments[1].toString();
                 auto propertyValue = args.arguments[2];
 
-                ViewManager* const viewManager = self->getViewManager();
-                jassert(viewManager);
-
                 viewManager->setViewProperty(viewId, propertyName, propertyValue);
                 return juce::var::undefined();
-            }, (void *) this);
+            });
 
-            engine.registerNativeMethod("__BlueprintNative__", "setRawTextValue", [](void* stash, const juce::var::NativeFunctionArgs& args) {
-                auto self = reinterpret_cast<ReactApplicationRoot*>(stash);
-
-                jassert (self != nullptr);
+            engine.registerNativeMethod("__BlueprintNative__", "setRawTextValue", [this](const juce::var::NativeFunctionArgs& args) {
                 jassert (args.numArguments == 2);
+                jassert(viewManager);
 
                 ViewId viewId = args.arguments[0];
                 auto textValue = args.arguments[1].toString();
 
-                ViewManager* const viewManager = self->getViewManager();
-                jassert(viewManager);
-
                 viewManager->setRawTextValue(viewId, textValue);
                 return juce::var::undefined();
-            }, (void *) this);
+            });
 
-            engine.registerNativeMethod("__BlueprintNative__", "addChild", [](void* stash, const juce::var::NativeFunctionArgs& args) {
-                auto self = reinterpret_cast<ReactApplicationRoot*>(stash);
-
-                jassert (self != nullptr);
+            engine.registerNativeMethod("__BlueprintNative__", "addChild", [this](const juce::var::NativeFunctionArgs& args) {
                 jassert (args.numArguments >= 2);
+                jassert(viewManager);
 
                 ViewId parentId = args.arguments[0];
                 ViewId childId = args.arguments[1];
@@ -596,42 +560,29 @@ namespace blueprint
                 if (args.numArguments > 2)
                     index = args.arguments[2];
 
-                ViewManager* const viewManager = self->getViewManager();
-                jassert(viewManager);
-
                 viewManager->addChild(parentId, childId, index);
                 return juce::var::undefined();
-            }, (void *) this);
+            });
 
-            engine.registerNativeMethod("__BlueprintNative__", "removeChild", [](void* stash, const juce::var::NativeFunctionArgs& args) {
-                auto self = reinterpret_cast<ReactApplicationRoot*>(stash);
-
-                jassert (self != nullptr);
+            engine.registerNativeMethod("__BlueprintNative__", "removeChild", [this](const juce::var::NativeFunctionArgs& args) {
                 jassert (args.numArguments == 2);
+                jassert(viewManager);
 
                 ViewId parentId = args.arguments[0];
                 ViewId childId = args.arguments[1];
 
-                ViewManager* const viewManager = self->getViewManager();
-                jassert(viewManager);
-
                 viewManager->removeChild(parentId, childId);
                 return juce::var::undefined();
-            }, (void *) this);
+            });
 
-            engine.registerNativeMethod("__BlueprintNative__", "getRootInstanceId", [](void* stash, const juce::var::NativeFunctionArgs& args) {
-                auto self = reinterpret_cast<ReactApplicationRoot*>(stash);
-
-                jassert (self != nullptr);
+            engine.registerNativeMethod("__BlueprintNative__", "getRootInstanceId", [this](const juce::var::NativeFunctionArgs& args) {
                 jassert (args.numArguments == 0);
-
-                return juce::var(self->getViewId());
-            }, (void *) this);
+                return juce::var(getViewId());
+            });
         }
 
         //==============================================================================
         bool hotReloadEnabled = false;
-        bool bundleValid      = false;
 
         std::unique_ptr<ViewManager>            viewManager;
         std::unique_ptr<BundleWatcher>          bundleWatcher;
