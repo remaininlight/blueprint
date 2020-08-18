@@ -135,6 +135,10 @@ namespace blueprint
         juce::var invoke (const juce::String& name, T... args);
 
         //==============================================================================
+        /** Resets the internal Duktape context, clearing the value stack and destroying native callbacks. */
+        void reset();
+
+        //==============================================================================
         /** Pauses execution and waits for a debug client to attach and begin a debug session. */
         void debuggerAttach();
 
@@ -164,9 +168,6 @@ namespace blueprint
         //==============================================================================
         /** Helper for cleaning up native function temporaries. */
         void removeLambdaHelper (LambdaHelper* helper);
-
-        /** Helper for resetting the duktape engine after a recoverable error. */
-        void internalErrorHandler();
 
         /** Helper for pushing a juce::var to the duktape stack. */
         void pushVarToDukStack (duk_context* ctx, const juce::var& v);

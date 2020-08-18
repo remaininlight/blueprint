@@ -189,7 +189,16 @@ namespace blueprint
             // Clear error state from previous js evals
             errorText.reset();
 
-            try {
+            if (hotReloadEnabled)
+            {
+                jassert(bundleWatcher);
+
+                if (!bundleWatcher->watching(bundle))
+                    bundleWatcher->watch(bundle);
+            }
+
+            try
+            {
                 // Register internal React.js backend rendering methods
                 registerNativeRenderingHooks();
 
@@ -201,18 +210,19 @@ namespace blueprint
                 if (afterBundleEval)
                     afterBundleEval(bundle);
 
-                if (hotReloadEnabled)
-                {
-                    jassert(bundleWatcher);
-
-                    if (!bundleWatcher->watching(bundle))
-                        bundleWatcher->watch(bundle);
-                }
-
                 return result;
-            } catch (const EcmascriptEngine::Error& err) {
+            }
+            catch (const EcmascriptEngine::Error& err)
+            {
+#if JUCE_DEBUG
                 handleBundleError(err);
                 return juce::var();
+#else
+                // In release builds, we don't catch errors and show the red screen,
+                // we allow the exception to raise up to the user to be handled properly
+                // for a production app.
+                throw err;
+#endif
             }
         }
 
@@ -240,10 +250,23 @@ namespace blueprint
         {
             JUCE_ASSERT_MESSAGE_THREAD
 
+            // We early return here in the event that we're currently showing the red error
+            // screen. This prevents subsequent errors caused by dispatching events with an
+            // incorrect engine state from overwriting the first error message.
+            if (errorText)
+                return;
+
             try {
                 engine.invoke("__BlueprintNative__.dispatchEvent", eventType, std::forward<T>(args)...);
             } catch (const EcmascriptEngine::Error& err) {
+#if JUCE_DEBUG
                 handleBundleError(err);
+#else
+                // In release builds, we don't catch errors and show the red screen,
+                // we allow the exception to raise up to the user to be handled properly
+                // for a production app.
+                throw err;
+#endif
             }
         }
 
@@ -272,7 +295,10 @@ namespace blueprint
         void enableHotReloading()
         {
             bundleWatcher = std::make_unique<BundleWatcher>(
-                                [=](const juce::File& bundle) { handleBundleChanged(bundle); });
+                [=](const juce::File& bundle) {
+                    handleBundleChanged(bundle);
+                }
+            );
 
             hotReloadEnabled = true;
         }
@@ -394,6 +420,9 @@ namespace blueprint
             JUCE_ASSERT_MESSAGE_THREAD
             jassert(handler);
 
+            // TODO: Here we have a case of `invoke` where the callback is not a temporary. Perhaps
+            // we want two different `invoke` methods: one for immeidately cleaning up temporaries,
+            // and one which persists native functions. `pinvoke`? `invokeWithPersistentNativeFunctions`?
             return engine.invoke("__BlueprintNative__.subscribe", eventType, std::move(handler));
         }
 
@@ -416,6 +445,7 @@ namespace blueprint
         {
             JUCE_ASSERT_MESSAGE_THREAD
 
+            engine.reset();
             initViewManager();
             evaluate(bundle);
         }
@@ -426,7 +456,6 @@ namespace blueprint
             JUCE_ASSERT_MESSAGE_THREAD
             DBG(juce::String("Error in script evaluation: ") + err.what());
 
-            viewManager.reset();
             errorText = std::make_unique<juce::AttributedString>(err.stack);
 
 #if JUCE_WINDOWS

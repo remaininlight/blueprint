@@ -33,7 +33,7 @@ namespace blueprint
 
         static void safeEvalString(duk_context* ctx, const juce::String& s)
         {
-            if (duk_peval_string(ctx, s.toRawUTF8()) != 0)
+            if (duk_peval_string(ctx, s.toRawUTF8()) != DUK_EXEC_SUCCESS)
             {
                 const juce::String stack = duk_safe_to_stacktrace(ctx, -1);
                 const juce::String msg = duk_safe_to_string(ctx, -1);
@@ -44,13 +44,13 @@ namespace blueprint
 
         static void safeCompileFile(duk_context* ctx, const juce::File& file)
         {
-            auto const& name = file.getFileName().toRawUTF8();
-            auto const& body = file.loadFileAsString().toRawUTF8();
+            auto name = file.getFileName();
+            auto body = file.loadFileAsString();
 
             // Push the js filename to be compiled/evaluated
-            duk_push_string(ctx, name);
+            duk_push_string(ctx, name.toRawUTF8());
 
-            if (duk_pcompile_string_filename(ctx, DUK_COMPILE_EVAL, body) != 0)
+            if (duk_pcompile_string_filename(ctx, DUK_COMPILE_EVAL, body.toRawUTF8()) != DUK_EXEC_SUCCESS)
             {
                 const juce::String stack = duk_safe_to_stacktrace(ctx, -1);
                 const juce::String msg = duk_safe_to_string(ctx, -1);
@@ -84,7 +84,7 @@ namespace blueprint
         try {
             detail::safeEvalString(ctx, code);
         } catch (Error const& err) {
-            internalErrorHandler();
+            reset();
             throw err;
         }
 
@@ -103,7 +103,7 @@ namespace blueprint
             detail::safeCompileFile(ctx, code);
             detail::safeCall(ctx, 0);
         } catch (Error const& err) {
-            internalErrorHandler();
+            reset();
             throw err;
         }
 
@@ -138,7 +138,7 @@ namespace blueprint
         try {
             detail::safeEvalString(ctx, target);
         } catch (Error const& err) {
-            internalErrorHandler();
+            reset();
             throw err;
         }
 
@@ -167,7 +167,7 @@ namespace blueprint
             // Invocation
             detail::safeCall(ctx, nargs);
         } catch (Error const& err) {
-            internalErrorHandler();
+            reset();
             throw err;
         }
 
@@ -180,9 +180,22 @@ namespace blueprint
         // but specifically where we have LambdaHelper allocations for these
         // temporaries, we want to keep our release pool fairly small. For that
         // reason, we manually invoke a garbage collection pass right away.
-        duk_gc(ctx, 0);
+        // TODO: Revisit with lightfuncs
+        // duk_gc(ctx, 0);
 
         return result;
+    }
+
+    void EcmascriptEngine::reset()
+    {
+        // Clear out the stack so we can re-register native functions
+        // after we clear out the lambda release pool etc.
+        while (duk_get_top(ctx))
+            duk_remove(ctx, duk_get_top_index(ctx));
+
+        // Clear the LambdaHelper release pool as duktape does not call object
+        // finalizers in the event of an evaluation error or duk_pcall failure.
+        lambdaReleasePool.clear();
     }
 
     //==============================================================================
@@ -294,18 +307,6 @@ namespace blueprint
     void EcmascriptEngine::removeLambdaHelper (LambdaHelper* helper)
     {
         lambdaReleasePool.erase(helper->id);
-    }
-
-    void EcmascriptEngine::internalErrorHandler()
-    {
-        // Clear out the stack so we can re-register native functions
-        // after we clear out the lambda release pool etc.
-        while (duk_get_top(ctx))
-            duk_remove(ctx, duk_get_top_index(ctx));
-
-        // Clear the LambdaHelper release pool as duktape does not call object
-        // finalizers in the event of an evaluation error or duk_pcall failure.
-        lambdaReleasePool.clear();
     }
 
     void EcmascriptEngine::pushVarToDukStack (duk_context* ctx, const juce::var& v)
@@ -449,7 +450,7 @@ namespace blueprint
                             try {
                                 detail::safeCall(ctx, args.numArguments);
                             } catch (Error const& err) {
-                                internalErrorHandler();
+                                reset();
                                 throw err;
                             }
 
@@ -461,6 +462,7 @@ namespace blueprint
                             // but specifically where we have LambdaHelper allocations for these
                             // temporaries, we want to keep our release pool fairly small. For that
                             // reason, we manually invoke a garbage collection pass right away.
+                            // TODO: Revisit with lightfuncs
                             duk_gc(ctx, 0);
 
                             // Callbacks don't really need return args?
